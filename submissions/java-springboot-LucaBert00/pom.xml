@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.1</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>conduit</groupId>
+    <artifactId>conduit</artifactId>
+    <version>1.0.0</version>
+    <name>conduit</name>
+    <description>RealWorld Conduit API, Spring Boot 4 + virtual threads, tuned for the multicore challenge (direct front)</description>
+
+    <properties>
+        <java.version>27</java.version>
+        <!-- latest pgjdbc (Boot 4.1.1 manages 42.7.13) -->
+        <postgresql.version>42.7.14</postgresql.version>
+        <java-jwt.version>4.6.1</java-jwt.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <!-- BCryptPasswordEncoder only, not the Spring Security filter chain -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+        <!-- HS256 JWT. jjwt and nimbus-jose-jwt both refuse HMAC secrets shorter than 256 bits
+             (the dev secret is 18 bytes); auth0 java-jwt accepts any secret, like the other stacks. -->
+        <dependency>
+            <groupId>com.auth0</groupId>
+            <artifactId>java-jwt</artifactId>
+            <version>${java-jwt.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>conduit</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
