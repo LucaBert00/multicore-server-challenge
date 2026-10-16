@@ -1,5 +1,6 @@
 package conduit;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -27,9 +28,18 @@ class CommentController {
 
     @GetMapping("/api/articles/{slug}/comments")
     Map<String, List<Dto.Comment>> list(Auth.Viewer viewer, @PathVariable String slug) {
-        long id = ArticleController.articleId(db, slug);
-        return Map.of("comments",
-                db.query(Sql.COMMENTS, Sql.params().bigint("viewer", viewer.id()).bigint("id", id), Sql.COMMENT_ROW));
+        List<Sql.CommentRow> rows = db.query(Sql.COMMENTS_PAGE,
+                Sql.params().bigint("viewer", viewer.id()).text("slug", slug), Sql.COMMENTS_ROW);
+        if (rows.isEmpty()) {
+            throw ApiException.notFound("article");
+        }
+        List<Dto.Comment> comments = new ArrayList<>(rows.size());
+        for (Sql.CommentRow row : rows) {
+            if (row.present()) {
+                comments.add(row.comment());
+            }
+        }
+        return Map.of("comments", comments);
     }
 
     @PostMapping("/api/articles/{slug}/comments")

@@ -163,12 +163,25 @@ final class Sql {
 
     // ---- comments ----
 
-    static final String COMMENTS = """
-            SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
+    /**
+     * Article and its newest comments in one round trip. Driving from {@code articles} keeps the two
+     * failure modes apart: no row at all means the slug is unknown (404), while a row whose comment columns
+     * are null means the article exists but has no comments (empty list).
+     */
+    static final String COMMENTS_PAGE = """
+            SELECT a.id AS article_id, c.id AS comment_id, c.body, c.created_at, c.updated_at,
+                   u.username, u.bio, u.image,
                    EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = c.author_id) AS following
-              FROM comments c JOIN users u ON u.id = c.author_id
-             WHERE c.article_id = :id
-             ORDER BY c.created_at DESC, c.id DESC LIMIT 100""";
+              FROM articles a
+              LEFT JOIN LATERAL (
+                   SELECT c2.id, c2.body, c2.created_at, c2.updated_at, c2.author_id
+                     FROM comments c2
+                    WHERE c2.article_id = a.id
+                    ORDER BY c2.created_at DESC, c2.id DESC
+                    LIMIT 100
+              ) c ON true
+              LEFT JOIN users u ON u.id = c.author_id
+             WHERE a.slug = :slug""";
 
     static final String COMMENT_INSERT = """
             WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES (:id, :viewer, :body)
@@ -259,13 +272,19 @@ final class Sql {
     static final RowMapper<ArticleWithCount> ARTICLE_LIST_COUNTED_ROW =
             (rs, n) -> new ArticleWithCount(article(rs, false), rs.getLong("articles_count"));
 
-    static final RowMapper<Dto.Comment> COMMENT_ROW = (rs, n) -> new Dto.Comment(
-            rs.getLong("id"),
-            Dto.ts(time(rs, "created_at")),
-            Dto.ts(time(rs, "updated_at")),
-            rs.getString("body"),
-            new Dto.Profile(rs.getString("username"), rs.getString("bio"), rs.getString("image"),
-                    rs.getBoolean("following")));
+    /** One row of {@link #COMMENTS_PAGE}: either a comment, or the article-exists-but-has-none placeholder. */
+    record CommentRow(boolean present, Dto.Comment comment) {
+    }
+
+    static final RowMapper<CommentRow> COMMENTS_ROW = (rs, n) -> rs.getObject("comment_id") == null
+            ? new CommentRow(false, null)
+            : new CommentRow(true, new Dto.Comment(
+                    rs.getLong("comment_id"),
+                    Dto.ts(time(rs, "created_at")),
+                    Dto.ts(time(rs, "updated_at")),
+                    rs.getString("body"),
+                    new Dto.Profile(rs.getString("username"), rs.getString("bio"), rs.getString("image"),
+                            rs.getBoolean("following"))));
 
     static final RowMapper<Dto.Comment> NEW_COMMENT_ROW = (rs, n) -> new Dto.Comment(
             rs.getLong("id"),
