@@ -58,16 +58,32 @@ explicitly, and the count still has to come back when the page is empty.
 
 ## Plan, in order
 
-1. **Merge the page + count into one statement** (~32% of requests). Preserve the `LIMIT 1000`
-   cap; return the count on an empty page. `Sql.java`, `ArticleController.java`.
-2. **Single round trip for comments** (~20%). `CommentController.java:30-32` resolves slug→id
-   before fetching. Must still 404 on an unknown article but return an empty list for an
-   article with no comments — a `LEFT JOIN LATERAL` onto a one-row driver does that.
-3. **Enable response compression.** `SPEC.md`: "Nginx gzips JSON over 1 KB". Serving directly
-   (rule 10) gives that up unless the app does it, and no compression is configured today.
-4. **Right-size the pool.** `start.sh` computes `10 x cores` = 80 backends against
-   `max_connections = 100` on a box that shares 8 cores with Postgres. `connection-timeout=5000`
-   also turns saturation into 5-second stalls, which fails the p99 gate before the error gate.
+1. **~~Merge the page + count into one statement~~ — done.** (~32% of requests.) Preserved the
+   `LIMIT 1000` cap; empty pages fall back to the standalone count. Conformance green.
+2. **~~Single round trip for comments~~ — done.** (~20% of requests.) `LEFT JOIN LATERAL` off
+   `articles` keeps 404 (no row) distinct from empty list (null comment columns). Conformance green.
+3. **Right-size the pool.** `start.sh` used `10 x cores` = 80 backends against `max_connections=100`,
+   on a box sharing 8 cores with Postgres. The pool is only a ceiling, and sub-millisecond queries at
+   ~5.5k req/s need far less concurrency than 80 — 80 resident backends mostly buy scheduler thrash and
+   idle memory. Now `3 x cores`. Also `connection-timeout` 5000ms → 1000ms, so saturation fails fast
+   into the error budget instead of stalling past the `p99 < 1 s` gate.
+4. **Compression: deliberately NOT enabled.** See below.
+
+## Why compression is off
+
+`SPEC.md` notes Nginx gzips JSON over 1 KB, and serving directly (rule 10) gives that up — so it looks
+like free money to reclaim. It isn't, and the arithmetic is worth writing down:
+
+- A 10-row article list is roughly 5–10 KB of highly compressible JSON; `limit=10` with offset ≤ 40
+  keeps responses small.
+- Tomcat compresses at the JDK default level (~6) for every response over `compressMinSize`. Nginx's
+  default `gzip_comp_level` is **1**, so the app-side path is several times more expensive per byte
+  than the baseline it would be replacing. Spring Boot exposes no level knob for Tomcat.
+- At ~5.5k req/s that lands in the order of a core of the shared 8, spent to shrink traffic on a link
+  that is not the constraint — the load generator runs on separate machines and think time is 7 s.
+
+CPU is the scored resource here; bytes on the wire are not. So it is left off, and if it is ever tried
+it should be tried as a measurement on a box, not reasoned about.
 
 ## Explicitly not doing
 
