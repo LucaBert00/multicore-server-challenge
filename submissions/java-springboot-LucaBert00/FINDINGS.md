@@ -68,6 +68,18 @@ explicitly, and the count still has to come back when the page is empty.
    idle memory. Now `3 x cores`. Also `connection-timeout` 5000ms → 1000ms, so saturation fails fast
    into the error budget instead of stalling past the `p99 < 1 s` gate.
 4. **Compression: deliberately NOT enabled.** See below.
+5. **Collapse the double `favorites` probe into one `LEFT JOIN LATERAL`.** Every article row ran
+   `(SELECT count(*) ...)` plus `EXISTS (... AND user_id = :viewer)` over the same rows. Now one
+   pass returns both (`count(*)` + `bool_or(user_id = :viewer)`). `bool_or` yields NULL when there
+   are no favorites; `rs.getBoolean()` maps NULL → false so `favorited` is unchanged. Affects
+   `ARTICLE_COLS` (lists, feed) and `ARTICLE_FULL_SELECT` (detail, favorite/unfavorite read-back) —
+   ~52% of requests.
+
+## Unmeasured
+
+No performance measurement exists in this project yet, so none of the above is a claimed speedup:
+items 1–3 and 5 are round-trip / per-row-probe removals reasoned about from the request mix, not
+timed on a box. Conformance proves correctness only.
 
 ## Why compression is off
 
