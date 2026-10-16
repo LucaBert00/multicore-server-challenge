@@ -62,24 +62,35 @@ class ArticleController {
         String pageSql;
         String countSql;
         if (given(tag)) {
-            pageSql = Sql.LIST_TAG;
+            pageSql = Sql.LIST_TAG_COUNTED;
             countSql = Sql.COUNT_TAG;
             p.text("filter", tag);
         } else if (given(author)) {
-            pageSql = Sql.LIST_AUTHOR;
+            pageSql = Sql.LIST_AUTHOR_COUNTED;
             countSql = Sql.COUNT_AUTHOR;
             p.text("filter", author);
         } else if (given(favorited)) {
-            pageSql = Sql.LIST_FAVORITED;
+            pageSql = Sql.LIST_FAVORITED_COUNTED;
             countSql = Sql.COUNT_FAVORITED;
             p.text("filter", favorited);
         } else {
-            pageSql = Sql.LIST_ALL;
+            pageSql = Sql.LIST_ALL_COUNTED;
             countSql = Sql.COUNT_ALL;
         }
-        List<Dto.Article> articles = db.query(pageSql, p, Sql.ARTICLE_LIST_ROW);
-        Long count = db.queryForObject(countSql, p, Long.class);
-        return new ArticleList(articles, count);
+        return countedPage(pageSql, countSql, p);
+    }
+
+    /**
+     * The page and its capped total in one round trip. An empty page returns no row to carry the total,
+     * so that case asks for the count on its own -- rare, and it keeps an unknown tag or author an empty
+     * list rather than a wrong count.
+     */
+    private ArticleList countedPage(String pageSql, String countSql, Sql.Params p) {
+        List<Sql.ArticleWithCount> rows = db.query(pageSql, p, Sql.ARTICLE_LIST_COUNTED_ROW);
+        if (rows.isEmpty()) {
+            return new ArticleList(List.of(), db.queryForObject(countSql, p, Long.class));
+        }
+        return new ArticleList(rows.stream().map(Sql.ArticleWithCount::article).toList(), rows.get(0).count());
     }
 
     @GetMapping("/api/articles/feed")
@@ -87,9 +98,7 @@ class ArticleController {
             @RequestParam(required = false) String limit,
             @RequestParam(required = false) String offset) {
         Sql.Params p = page(Sql.params().bigint("viewer", auth.id()), limit, offset);
-        List<Dto.Article> articles = db.query(Sql.LIST_FEED, p, Sql.ARTICLE_LIST_ROW);
-        Long count = db.queryForObject(Sql.COUNT_FEED, p, Long.class);
-        return new ArticleList(articles, count);
+        return countedPage(Sql.LIST_FEED_COUNTED, Sql.COUNT_FEED, p);
     }
 
     @GetMapping("/api/articles/{slug}")

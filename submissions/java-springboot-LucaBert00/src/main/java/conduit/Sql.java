@@ -27,17 +27,28 @@ final class Sql {
 
     // ---- shared fragments ($1 = viewer) ----
 
-    static final String ARTICLE_LIST_SELECT = """
-            SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-                          WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
-                   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-                   EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = :viewer) AS favorited,
-                   u.username, u.bio, u.image,
-                   EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following
+    private static final String ARTICLE_COLS = """
+            a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+            ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+                   WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+            (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+            EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = :viewer) AS favorited,
+            u.username, u.bio, u.image,
+            EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following""";
+
+    private static final String ARTICLE_FROM = """
+
               FROM articles a
               JOIN users u ON u.id = a.author_id
             """;
+
+    /**
+     * The page with the capped total as one more column, so page and count cost a single round trip.
+     * The total stays a subquery with its own LIMIT 1000: a window function would be evaluated before the
+     * page's LIMIT/OFFSET and would count the whole table instead of the capped prefix.
+     */
+    static final String ARTICLE_LIST_SELECT_COUNTED =
+            "SELECT " + ARTICLE_COLS + ",\n            (%s) AS articles_count" + ARTICLE_FROM;
 
     static final String ARTICLE_FULL_SELECT = """
             SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
@@ -85,31 +96,36 @@ final class Sql {
     static final String UNFOLLOW = "DELETE FROM follows WHERE follower_id = :viewer AND followee_id = :id";
 
     // ---- article lists ----
+    //
+    // Each filter has a "counted" variant: the same page with the capped total as an extra column, so one
+    // round trip replaces two. They are only used when the page is non-empty; an empty page yields no row to
+    // carry the total, so the caller falls back to the standalone COUNT_* statement (see ArticleController.list).
 
-    static final String LIST_ALL = ARTICLE_LIST_SELECT + ORDER_PAGE;
     static final String COUNT_ALL = "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s";
+    static final String LIST_ALL_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_ALL) + ORDER_PAGE;
 
-    static final String LIST_TAG = ARTICLE_LIST_SELECT
-            + "WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)"
-            + " ORDER BY a.id DESC";
     static final String COUNT_TAG =
             "SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) LIMIT 1000) s";
+    static final String LIST_TAG_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_TAG)
+            + "WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)"
+            + " ORDER BY a.id DESC";
 
-    static final String LIST_AUTHOR = ARTICLE_LIST_SELECT + "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :filter)" + ORDER_PAGE;
     static final String COUNT_AUTHOR =
             "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = :filter) LIMIT 1000) s";
+    static final String LIST_AUTHOR_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_AUTHOR)
+            + "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :filter)" + ORDER_PAGE;
 
-    static final String LIST_FAVORITED = ARTICLE_LIST_SELECT
-            + "WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)"
-            + " ORDER BY a.id DESC";
     static final String COUNT_FAVORITED =
             "SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) LIMIT 1000) s";
-
-    static final String LIST_FEED = ARTICLE_LIST_SELECT
-            + "WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (:limit::int + :offset::int)) x WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)"
+    static final String LIST_FAVORITED_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_FAVORITED)
+            + "WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)"
             + " ORDER BY a.id DESC";
+
     static final String COUNT_FEED =
             "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer) LIMIT 1000) s";
+    static final String LIST_FEED_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_FEED)
+            + "WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (:limit::int + :offset::int)) x WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)"
+            + " ORDER BY a.id DESC";
 
     // ---- single articles ----
 
@@ -234,8 +250,14 @@ final class Sql {
                         rs.getBoolean("following")));
     }
 
-    static final RowMapper<Dto.Article> ARTICLE_LIST_ROW = (rs, n) -> article(rs, false);
     static final RowMapper<Dto.Article> ARTICLE_FULL_ROW = (rs, n) -> article(rs, true);
+
+    /** One page row plus the capped total that rode along on the same round trip. */
+    record ArticleWithCount(Dto.Article article, long count) {
+    }
+
+    static final RowMapper<ArticleWithCount> ARTICLE_LIST_COUNTED_ROW =
+            (rs, n) -> new ArticleWithCount(article(rs, false), rs.getLong("articles_count"));
 
     static final RowMapper<Dto.Comment> COMMENT_ROW = (rs, n) -> new Dto.Comment(
             rs.getLong("id"),
