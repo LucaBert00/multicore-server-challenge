@@ -86,12 +86,63 @@ explicitly, and the count still has to come back when the page is empty.
    yields the same rows. Ordering, pagination, capped count and the single-round-trip contract are
    unchanged; empty pages still fall back to `COUNT_FEED`. Cost went from one index walk + partial
    sort per followee to one semi-join against the same index. Part of the ~32% lists path.
+7. **Page before probing: the offset rows were paying for probes they were thrown away from.** The
+   per-row probes were not the problem on the list queries — the *paging* was. A top-level
+   `ORDER BY a.id DESC LIMIT :limit OFFSET :offset` is applied after them, so the planner walks
+   `offset + limit` entries of `articles_pkey` and runs the tag array, the favorites aggregate and the
+   users join on every one of them, then discards the first `offset` rows: at `limit=10 offset=40` all
+   three probes report `loops=50`. The page is now taken by a derived table first, so each probe runs
+   exactly `limit` times. Root-node buffer counts and probe loop counts, median of 8 interleaved runs:
+
+   | page (`limit=10`) | before: buffers / probe runs | after: buffers / probe runs |
+   |---|---|---|
+   | `offset=0` | 190 / 10 | 190 / 10 (unchanged, as expected) |
+   | `offset=20` | 473 / 30 | 191 / 10 |
+   | `offset=40` | 760 / 50 | 195 / 10 |
+
+   Same statement, same single round trip, same capped count, same rows: verified row for row against
+   the previous SQL for nine request shapes (all at offsets 0/20/40, default limit 20, author, tag,
+   favorited, feed at offsets 0 and 40) — 90 rows, identical slug, tag list, favorites count,
+   `favorited`, `following` and author. It applies to `LIST_ALL_COUNTED`, `LIST_AUTHOR_COUNTED` and
+   `LIST_FEED_COUNTED`. `LIST_TAG_COUNTED` and `LIST_FAVORITED_COUNTED` choose their page with an
+   `IN`-subquery on the article id, which already carries at most `limit` rows into the probes, so
+   there is no offset waste to remove and they keep their shape. The capped total is untouched: still
+   one `Seq Scan` of `articles` that stops at 1000 rows (~36 buffers, no per-row cost).
+   `vu.go:281` only ever sends offsets 0–40, so 30% of list and feed requests were paying for up to 40
+   rows of discarded probe work; the other 70% now provably pay exactly what they paid before.
 
 ## Unmeasured
 
-No performance measurement exists in this project yet, so none of the above is a claimed speedup:
-items 1–3 and 5–6 are round-trip / per-row-probe / query-plan removals reasoned about from the request
-mix and the schema's indexes, not timed on a box. Conformance proves correctness only.
+No application-level measurement exists in this project yet, so none of the above is a claimed
+speedup: items 1–3 and 5–6 are round-trip / per-row-probe / query-plan removals reasoned about from the
+request mix and the schema's indexes, not timed on a box. Conformance proves correctness only.
+
+Item 7 is the one place with numbers behind it, and they are **statement-level** numbers from
+`EXPLAIN (ANALYZE, BUFFERS)` on a throwaway Postgres 18 cluster seeded to the challenge's cardinalities
+(100k users, 500k articles, 200 tags, 1.24M article_tags, 5.0M favorites, 2.5M comments, 2.0M follows —
+row counts and per-row fan-outs from `bench/seed/seed.go`, values generated in SQL rather than by
+`seedgen`). That is a laptop, warm cache, one page at a time: it is evidence about plans and buffer
+traffic, not about this app's throughput on the challenge box, and no such claim is made from it.
+Buffer counts and node loop counts are deterministic and are what the verdict rests on; the
+wall-clock millisecond figures moved by 3–4x run to run on the same statement and are only quoted as
+orders of magnitude.
+
+Two audit findings that the measurements contradicted, kept here because they were not obvious:
+
+- **The `following` probe was never per-row.** With `follower_id` constant, the planner pulls the
+  `EXISTS` up as an InitPlan: one `Index Only Scan` on `follows_pkey` for the viewer's followees
+  (`loops=1`, ~23 rows, 4 buffers, tens of microseconds for the whole page) and then a hash membership
+  test per row that has no node of its own. Writing it explicitly as
+  `a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer)` produced an
+  identical plan and no measurable change, so it was not adopted.
+- **The `tag ARRAY` inner join scans all 200 rows of `tags` per article row** — the planner hash-joins
+  against a `Seq Scan` of the whole tag table to resolve ~2.4 names. That looked like the obvious
+  remaining waste. Two fixes were measured and both rejected: resolving names through `tags_pkey`
+  (tag subplan 74 → 102 buffers and 10 → 24 scans of `tags`; statement time indistinguishable), and
+  batching the whole page's tags in one grouped pass (0.2 ms of tag work instead of ~0.5, but 190 → 218
+  buffers at offset 0, plus a second column list to maintain). It stays as written. An `EXISTS`-style
+  `following` folded to the constant it already is on the feed was also measured and dropped: it is a
+  provable equivalence, but the feed is ~8% of requests and the probe it removes is 4 buffers.
 
 ## Why compression is off
 

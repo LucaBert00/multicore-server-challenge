@@ -36,9 +36,8 @@ final class Sql {
             u.username, u.bio, u.image,
             EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following""";
 
-    private static final String ARTICLE_FROM = """
-
-              FROM articles a
+    /** The users join and the favorites aggregate: the per-row probes, over rows already chosen. */
+    private static final String ARTICLE_ENRICH = """
               JOIN users u ON u.id = a.author_id
               LEFT JOIN LATERAL (SELECT count(*) AS c,
                                         bool_or(f.user_id = :viewer) AS fav
@@ -46,13 +45,40 @@ final class Sql {
                                   WHERE f.article_id = a.id) fav ON true
             """;
 
+    /** Ordering every list variant ends with; the page itself is taken by {@link #paged}. */
+    private static final String ORDER_BY_ID_DESC = " ORDER BY a.id DESC";
+
     /**
-     * The page with the capped total as one more column, so page and count cost a single round trip.
-     * The total stays a subquery with its own LIMIT 1000: a window function would be evaluated before the
-     * page's LIMIT/OFFSET and would count the whole table instead of the capped prefix.
+     * A page of articles plus the capped total as one more column, so page and count cost a single round
+     * trip. The page is taken by a derived table first, because a top-level LIMIT/OFFSET is applied
+     * <em>after</em> the probes: the planner walks offset + limit index entries and runs the tags, favorites
+     * and users probes on every one of them, then throws the offset away. Paging first runs each probe
+     * exactly {@code limit} times. Measured on a Postgres 18 cluster seeded to the challenge's
+     * cardinalities: 760 -> 195 buffers and 50 -> 10 probe executions for limit=10 offset=40, and no change
+     * at offset 0. The total stays a subquery with its own LIMIT 1000: a window function would count the
+     * whole table instead of the capped prefix.
      */
-    static final String ARTICLE_LIST_SELECT_COUNTED =
-            "SELECT " + ARTICLE_COLS + ",\n            (%s) AS articles_count" + ARTICLE_FROM;
+    private static String paged(String where, String count) {
+        return "SELECT " + ARTICLE_COLS + ",\n            (" + count + ") AS articles_count"
+                + "\n              FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id\n"
+                + "                      FROM articles a" + where + "\n"
+                + "                     ORDER BY a.id DESC LIMIT :limit OFFSET :offset) a"
+                + ARTICLE_ENRICH
+                + ORDER_BY_ID_DESC;
+    }
+
+    /**
+     * The same, for the two variants that choose their page with an IN-subquery on the article id. Those
+     * already carry at most {@code limit} rows into the probes, so there is no offset waste to remove and
+     * they keep paging where the filter is.
+     */
+    private static String unpaged(String where, String count) {
+        return "SELECT " + ARTICLE_COLS + ",\n            (" + count + ") AS articles_count"
+                + "\n              FROM articles a"
+                + ARTICLE_ENRICH
+                + where
+                + ORDER_BY_ID_DESC;
+    }
 
     static final String ARTICLE_FULL_SELECT = """
             SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
@@ -63,14 +89,7 @@ final class Sql {
                    u.username, u.bio, u.image,
                    EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following
               FROM articles a
-              JOIN users u ON u.id = a.author_id
-              LEFT JOIN LATERAL (SELECT count(*) AS c,
-                                        bool_or(f.user_id = :viewer) AS fav
-                                   FROM favorites f
-                                  WHERE f.article_id = a.id) fav ON true
-            """;
-
-    static final String ORDER_PAGE = " ORDER BY a.id DESC LIMIT :limit OFFSET :offset";
+            """ + ARTICLE_ENRICH;
 
     // ---- users ----
 
@@ -110,24 +129,24 @@ final class Sql {
     // carry the total, so the caller falls back to the standalone COUNT_* statement (see ArticleController.list).
 
     static final String COUNT_ALL = "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s";
-    static final String LIST_ALL_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_ALL) + ORDER_PAGE;
+    static final String LIST_ALL_COUNTED = paged("", COUNT_ALL);
 
     static final String COUNT_TAG =
             "SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) LIMIT 1000) s";
-    static final String LIST_TAG_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_TAG)
-            + "WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)"
-            + " ORDER BY a.id DESC";
+    static final String LIST_TAG_COUNTED = unpaged(
+            "WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :filter) ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)",
+            COUNT_TAG);
 
     static final String COUNT_AUTHOR =
             "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = :filter) LIMIT 1000) s";
-    static final String LIST_AUTHOR_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_AUTHOR)
-            + "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :filter)" + ORDER_PAGE;
+    static final String LIST_AUTHOR_COUNTED = paged(
+            " WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :filter)", COUNT_AUTHOR);
 
     static final String COUNT_FAVORITED =
             "SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) LIMIT 1000) s";
-    static final String LIST_FAVORITED_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_FAVORITED)
-            + "WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)"
-            + " ORDER BY a.id DESC";
+    static final String LIST_FAVORITED_COUNTED = unpaged(
+            "WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :filter) ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)",
+            COUNT_FAVORITED);
 
     static final String COUNT_FEED =
             "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer) LIMIT 1000) s";
@@ -135,9 +154,10 @@ final class Sql {
     // newest (limit + offset) rows and then the newest page of the union is the same set as the global page:
     // anything inside the global top (limit + offset) is also inside its own author's top (limit + offset).
     // articles_author_idx (author_id, id DESC) serves this as a single semi-join, where the old form walked the
-    // index once per followee and sorted the union.
-    static final String LIST_FEED_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_FEED)
-            + "WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer)" + ORDER_PAGE;
+    // index once per followee and sorted the union. Paged before the probes, so a page at offset n does not
+    // probe n rows it is about to discard.
+    static final String LIST_FEED_COUNTED = paged(
+            " WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer)", COUNT_FEED);
 
     // ---- single articles ----
 
