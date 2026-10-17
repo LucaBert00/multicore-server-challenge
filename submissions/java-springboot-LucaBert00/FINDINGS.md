@@ -74,12 +74,24 @@ explicitly, and the count still has to come back when the page is empty.
    are no favorites; `rs.getBoolean()` maps NULL → false so `favorited` is unchanged. Affects
    `ARTICLE_COLS` (lists, feed) and `ARTICLE_FULL_SELECT` (detail, favorite/unfavorite read-back) —
    ~52% of requests.
+6. **Feed candidate list: one global page instead of a per-followee fan-out.** `LIST_FEED_COUNTED`
+   built its candidate set with `CROSS JOIN LATERAL` — `articles_author_idx (author_id, id DESC)`
+   walked once per followee, `LIMIT (limit + offset)` rows each — then top-N-sorted the union and
+   paged it. Now `WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE
+   fo.follower_id = :viewer)` with a single `ORDER BY a.id DESC LIMIT/OFFSET`, the same shape as
+   `LIST_AUTHOR_COUNTED`, and the same predicate `COUNT_FEED` already used.
+   This is an equivalence, not an approximation: the global top-`limit + offset` of the union is a
+   subset of the union of each author's top-`limit + offset` (anything in the global prefix is in its
+   own author's prefix), and each author's prefix is a subset of the union — so paging either one
+   yields the same rows. Ordering, pagination, capped count and the single-round-trip contract are
+   unchanged; empty pages still fall back to `COUNT_FEED`. Cost went from one index walk + partial
+   sort per followee to one semi-join against the same index. Part of the ~32% lists path.
 
 ## Unmeasured
 
 No performance measurement exists in this project yet, so none of the above is a claimed speedup:
-items 1–3 and 5 are round-trip / per-row-probe removals reasoned about from the request mix, not
-timed on a box. Conformance proves correctness only.
+items 1–3 and 5–6 are round-trip / per-row-probe / query-plan removals reasoned about from the request
+mix and the schema's indexes, not timed on a box. Conformance proves correctness only.
 
 ## Why compression is off
 

@@ -131,9 +131,13 @@ final class Sql {
 
     static final String COUNT_FEED =
             "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer) LIMIT 1000) s";
+    // One global page over "articles by anyone I follow", not a per-followee fan-out. Taking each followee's
+    // newest (limit + offset) rows and then the newest page of the union is the same set as the global page:
+    // anything inside the global top (limit + offset) is also inside its own author's top (limit + offset).
+    // articles_author_idx (author_id, id DESC) serves this as a single semi-join, where the old form walked the
+    // index once per followee and sorted the union.
     static final String LIST_FEED_COUNTED = String.format(ARTICLE_LIST_SELECT_COUNTED, COUNT_FEED)
-            + "WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (:limit::int + :offset::int)) x WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)"
-            + " ORDER BY a.id DESC";
+            + "WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer)" + ORDER_PAGE;
 
     // ---- single articles ----
 
