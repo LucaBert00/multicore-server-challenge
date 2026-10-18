@@ -6,7 +6,7 @@ will send. The point is to aim the work, not to claim a result.
 
 ## Status
 
-Conformance suite passes 197/197 (CI run `39132471806`, Ubuntu 24.04 + Postgres 18).
+Conformance suite passes 197/197 (CI run `39134098891`, Ubuntu 24.04 + Postgres 18).
 Item 8 changed no SQL: the per-comment `following` probe was measured, found not to be
 per-row, and left as written. Issue #4, the tags endpoint, is a verify-and-leave of the same
 shape and changed no SQL either: `ORDER BY name` is satisfied by the `tags_name_key` index, so
