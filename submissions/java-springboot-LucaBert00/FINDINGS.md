@@ -6,7 +6,7 @@ will send. The point is to aim the work, not to claim a result.
 
 ## Status
 
-Conformance suite passes 197/197 (CI run `38938085881`, Ubuntu 24.04 + Postgres 18).
+Conformance suite passes 197/197 (CI run `39129762825`, Ubuntu 24.04 + Postgres 18).
 Item 8 changed no SQL: the per-comment `following` probe was measured, found not to be
 per-row, and left as written. Nothing about performance has been measured yet.
 
