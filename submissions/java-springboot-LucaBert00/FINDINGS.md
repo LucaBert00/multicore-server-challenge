@@ -8,9 +8,12 @@ will send. The point is to aim the work, not to claim a result.
 
 Conformance suite passes 197/197 (CI run `39132471806`, Ubuntu 24.04 + Postgres 18).
 Item 8 changed no SQL: the per-comment `following` probe was measured, found not to be
-per-row, and left as written. Issue #5, the runtime tuning gate, is a verify-and-leave that
-changed no code either: `-XX:+UseG1GC` is inert on the box JDK, so there was no flag to
-remove. Nothing about performance has been measured yet.
+per-row, and left as written. Issue #4, the tags endpoint, is a verify-and-leave of the same
+shape and changed no SQL either: `ORDER BY name` is satisfied by the `tags_name_key` index, so
+the plan has no `Sort` node at all — one `Index Only Scan`, 2 buffers, 60 µs, measured. Issue #5,
+the runtime tuning gate, is a verify-and-leave that changed no code either: `-XX:+UseG1GC` is
+inert on the box JDK, so there was no flag to remove. Nothing about performance has been measured
+yet.
 
 ## Request mix
 
@@ -42,7 +45,10 @@ Offsets are only `0, 10, 20, 30, 40`. With `limit=10`, the page query walks at m
 entries. Keyset pagination would be pure overhead. (Assumed a risk before reading this.)
 
 **`GET /api/tags` is cheap.** It is 21% of requests and unbounded, which looks alarming, but
-`seed/make-seed.sh:25` seeds **200 tags** — a 200-row sort over ~2 KB. Not worth optimising.
+`seed/make-seed.sh:25` and `:33` seed **200 tags** at both scales, and the plan contains no sort
+at all: `ORDER BY name` is satisfied by the `tags_name_key` index, so the statement is one
+`Index Only Scan` reading 2 buffers, and the response envelope is a measured 2,214 bytes
+(item 9). Not worth optimising.
 
 ## The actual finding
 
@@ -146,6 +152,60 @@ explicitly, and the count still has to come back when the page is empty.
    not true — `c.author_id` is null there, so the `EXISTS` matches nothing), and an unknown slug
    returns no row at all with every node `never executed`. Verdict: **verify-and-leave.** No probe
    and no round trip is removed by any rewrite available here, so the SQL is unchanged.
+9. **`GET /api/tags`: the `ORDER BY name` costs no sort at all — audited, left exactly as written.**
+   `Sql.TAGS` is `SELECT name FROM tags ORDER BY name` and `TagController` returns it through
+   `Map.of("tags", db.queryForList(...))`: one parameterless statement, one round trip, no join, no
+   per-row probe, no `LIMIT`. There was nothing here to merge and nothing to batch, so the only
+   question worth asking was whether the sort that `ORDER BY` implies is real. It is not. `name`
+   is `NOT NULL UNIQUE`, so `schema.sql:39-42` already carries a `tags_name_key` btree, a btree
+   scan returns entries in column order, and — because the index and the `ORDER BY` share that
+   column's collation — the index order *is* the requested order, so the clause can be satisfied
+   from the index with no sort step at all. `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` on Postgres
+   18.6, 7 warm runs, `max_parallel_workers_per_gather = 0` and `jit = off` pinned:
+
+   | what | measured |
+   |---|---|
+   | plan | `Index Only Scan using tags_name_key on public.tags` — one node, `rows=200.00 loops=1`, `Index Searches: 1` |
+   | `Sort` node | **none** |
+   | `Heap Fetches` | 0 |
+   | execution buffers | `shared hit=2` — identical on all 7 runs |
+   | execution time | 0.058–0.067 ms, median **0.060 ms** |
+   | planning buffers / time | `shared hit=95` on all 7 / 0.268–0.407 ms, median 0.287 ms |
+
+   Execution reads 2 buffers; planning reads 95. That inversion is the one line of the table that
+   is not about cheapness, so it is stated rather than buried: `EXPLAIN` re-plans on every
+   execution, so 60 µs is not what a caller necessarily pays per request unless the driver
+   amortises the plan, and whether PgJDBC does that for a zero-parameter statement was **not**
+   measured here. Nothing below turns on it.
+
+   The forced alternative is the control, and it is what makes the verdict robust rather than
+   lucky. With `enable_indexscan`/`indexonlyscan`/`bitmapscan = off` the plan really does sort:
+   `Sort Method: quicksort  Memory: 25kB`, 5 buffers at the root, 0.213 ms. So even the plan that
+   performs the 200-row sort costs 5 buffers and a fifth of a millisecond, and the planner takes
+   2 buffers and 60 µs instead. There is no version of this endpoint that is expensive, which is
+   the whole reason it is left alone.
+
+   The "~2 KB" the summary above used to assert is now measured rather than estimated: the 200
+   names total **1,405 bytes** (`sum(length(name))`, all ASCII, 4–12 chars each), their JSON array
+   is 2,205 bytes, and the envelope `{"tags":[…]}` that Jackson emits is **2,214 bytes**. So the
+   original figure was right about the payload and wrong about a sort happening.
+
+   One caveat, measured rather than assumed, because "2 buffers, no sort" would otherwise be an
+   unconditional claim it does not deserve: `Heap Fetches: 0` depends on the visibility map, and a
+   write dirties it. Insert one tag into the seeded table and the same index-only scan reports
+   `Heap Fetches: 16` and `shared hit=3` over 201 rows; after `DELETE` and `VACUUM (ANALYZE)` it is
+   back to `Heap Fetches: 0`, `shared hit=2`. `make-seed.sh` ends with `VACUUM (FREEZE, ANALYZE)`,
+   so the benchmark seed starts all-visible, and a tag write costs 3 buffers until the next vacuum.
+   It does not change the verdict; it only bounds how the verdict is worded.
+
+   Headroom, as an order of magnitude and explicitly **not** a measurement: ~21% of ~5.5k req/s is
+   ~1.15k statements/s of a 60 µs statement, i.e. ~0.07 of a core, or ~0.25 of a core if every call
+   paid the forced-sort plan instead. The whole measurable prize on this endpoint is the 3 buffers
+   between those two plans, against the 565 buffers item 7 turned on.
+
+   Endpoint shape unchanged: `TagController.java` and `Sql.java` are untouched by this issue —
+   same single statement, no `LIMIT`, the full sorted list returned. Verdict:
+   **verify-and-leave.**
 
 ## Unmeasured
 
@@ -172,6 +232,21 @@ is cheap is not a measurement of the endpoint. The seed it was measured on came 
 1,999,046 follows, with follows per user averaging 20.0 (p50 12, p99 125, max 892) and 46,725
 articles carrying no comments at all; `max_parallel_workers_per_gather = 0` and `jit = off` were
 pinned so the plan is deterministic.
+
+Item 9 is the third statement-level audit and the smallest of the three, and it earned its
+evidence more cheaply than the other two. `Sql.TAGS` reads one table whose cardinality the seed
+fixes at 200 at scale 1.0 and at 0.02 alike, so unlike items 7 and 8 it needed no article,
+comment or follow rows at all: `schema.sql` plus the 200 tag rows `seedgen` emits, loaded into a
+throwaway Postgres 18.6 on a CI runner and fingerprinted. The fingerprint came out
+`200 | 107424899296369204925`, exactly the value `seed/make-seed.sh` checks at both scales
+(lines 25 and 33), so the table under test is the seed's real table and not an approximation of
+one. What it establishes: no `Sort` node, 2 execution buffers, 60 µs median, `Heap Fetches: 0`
+because `make-seed.sh` ends in `VACUUM (FREEZE, ANALYZE)`. What it does not establish, and the
+distinction is the point: **verification of cheapness is NOT a speedup claim.** Nothing changed,
+so nothing got faster. It is a CI runner with a warm cache running one statement at a time, not
+the 8-shared-core challenge box; it says nothing about request-level behaviour, and in particular
+it does not settle whether the driver amortises a plan that costs 95 buffers to produce against
+one that then reads 2.
 
 Three audit findings that the measurements contradicted, kept here because they were not obvious:
 
