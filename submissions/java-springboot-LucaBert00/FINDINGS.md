@@ -7,7 +7,8 @@ will send. The point is to aim the work, not to claim a result.
 ## Status
 
 Conformance suite passes 197/197 (CI run `38938085881`, Ubuntu 24.04 + Postgres 18).
-Nothing about performance has been measured yet.
+Item 8 changed no SQL: the per-comment `following` probe was measured, found not to be
+per-row, and left as written. Nothing about performance has been measured yet.
 
 ## Request mix
 
@@ -110,6 +111,39 @@ explicitly, and the count still has to come back when the page is empty.
    one `Seq Scan` of `articles` that stops at 1000 rows (~36 buffers, no per-row cost).
    `vu.go:281` only ever sends offsets 0–40, so 30% of list and feed requests were paying for up to 40
    rows of discarded probe work; the other 70% now provably pay exactly what they paid before.
+8. **Comments hot path: the per-comment `following` probe — audited, left exactly as written.**
+   `COMMENTS_PAGE` already fetches article + newest 100 comments in one round trip, so the only thing
+   left on this path was the `EXISTS (... follows ...)` evaluated against `c.author_id` on every
+   comment row. Measured rather than assumed: it is **not** per-row. `follower_id` is constant, so
+   the planner pulls the `EXISTS` up as a single `SubPlan` with `loops=1` — one `Index Only Scan` on
+   `follows_pkey` for the viewer's followees, then a hash membership test per comment row that has no
+   node of its own. Median of 5 warm runs; root buffer counts were identical on all 5 of every row:
+
+   | `COMMENTS_PAGE` variant | root buffers | probe node | probe `loops` | probe buffers |
+   |---|---|---|---|---|
+   | as written | 314 | `Index Only Scan` on `follows_pkey` | **1** | 4 |
+   | probe rewritten as an explicit `IN`-subquery | 314 | same | 1 | 4 |
+   | probe correlated on the inner var (control) | 310 | same | **100** | 300 |
+   | as written, heaviest viewer in the dataset (892 followees) | 318 | same | 1 | 8 |
+   | probe deleted | 310 | none | — | — |
+   | probe deleted, heaviest viewer | 310 | none | — | — |
+
+   Three things fall out of that table. The probe costs **4 buffers** (8 for a viewer following 892
+   people) on a page of 100 comments, and that cost does not grow with the comment count: it is one
+   index scan for the whole page, not one per row. The control row is what this probe *would* cost
+   if it were per-row — 100 loops, 300 buffers — so that gap is the prize, and the planner already
+   takes it. And the `IN`-subquery rewrite is the same plan to the buffer, so it removes nothing and
+   was not adopted: the same reason as item 7, now confirmed on the comments path. The generic plan
+   (`PREPARE` + `force_generic_plan`, i.e. the bound `:viewer`/`:slug` the app really sends through
+   JDBC) is identical — `Index Cond: (follower_id = $1)`, `loops=1`.
+   The `LEFT JOIN LATERAL` is one `Index Scan using comments_article_idx` with `Index Searches: 1`
+   returning 100 rows in 6 buffers: one scan for the page whatever the comment count, which is why
+   the round trip is worth keeping as one statement.
+   Both failure shapes were re-checked on the measured statements rather than assumed: an article
+   with zero comments returns one row with the comment columns null and `following` false (non-null,
+   not true — `c.author_id` is null there, so the `EXISTS` matches nothing), and an unknown slug
+   returns no row at all with every node `never executed`. Verdict: **verify-and-leave.** No probe
+   and no round trip is removed by any rewrite available here, so the SQL is unchanged.
 
 ## Unmeasured
 
@@ -127,14 +161,26 @@ Buffer counts and node loop counts are deterministic and are what the verdict re
 wall-clock millisecond figures moved by 3–4x run to run on the same statement and are only quoted as
 orders of magnitude.
 
-Two audit findings that the measurements contradicted, kept here because they were not obvious:
+Item 8 is the same kind of evidence, and it is worth being precise about what it does and does not
+say. It says the probe is not per-row and costs 4 buffers; it does **not** say the app got faster,
+because nothing changed — an audit that finds nothing to remove is a verdict, not a speedup. The
+statement is still dominated by the `users` profile join (`loops=100`), and confirming that a probe
+is cheap is not a measurement of the endpoint. The seed it was measured on came out at 100k users,
+500k articles, 200 tags, 1,250,000 article_tags, 4,991,563 favorites, 2,504,281 comments and
+1,999,046 follows, with follows per user averaging 20.0 (p50 12, p99 125, max 892) and 46,725
+articles carrying no comments at all; `max_parallel_workers_per_gather = 0` and `jit = off` were
+pinned so the plan is deterministic.
+
+Three audit findings that the measurements contradicted, kept here because they were not obvious:
 
 - **The `following` probe was never per-row.** With `follower_id` constant, the planner pulls the
   `EXISTS` up as an InitPlan: one `Index Only Scan` on `follows_pkey` for the viewer's followees
   (`loops=1`, ~23 rows, 4 buffers, tens of microseconds for the whole page) and then a hash membership
   test per row that has no node of its own. Writing it explicitly as
   `a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer)` produced an
-  identical plan and no measurable change, so it was not adopted.
+  identical plan and no measurable change, so it was not adopted. Item 8 re-measured this on the
+  comments path rather than carrying the list-path result over, and got the same answer: `loops=1`,
+  4 buffers, and an `IN`-subquery rewrite that is the same plan to the buffer.
 - **The `tag ARRAY` inner join scans all 200 rows of `tags` per article row** — the planner hash-joins
   against a `Seq Scan` of the whole tag table to resolve ~2.4 names. That looked like the obvious
   remaining waste. Two fixes were measured and both rejected: resolving names through `tags_pkey`
@@ -143,6 +189,14 @@ Two audit findings that the measurements contradicted, kept here because they we
   buffers at offset 0, plus a second column list to maintain). It stays as written. An `EXISTS`-style
   `following` folded to the constant it already is on the feed was also measured and dropped: it is a
   provable equivalence, but the feed is ~8% of requests and the probe it removes is 4 buffers.
+- **The per-row probe on the comments path is the `users` join, not `following`.** With the `following`
+  probe pulled up and accounted for, `COMMENTS_PAGE`'s remaining cost is
+  `Index Scan using users_pkey on users u (actual rows=1.00 loops=100)` — 300 of the statement's 310
+  buffers, one `users_pkey` descent per comment row. Recorded as a lead, **not acted on here**: it is
+  the profile join every profile-bearing endpoint pays, and folding it into a batched pass is the same
+  kind of rewrite already measured and rejected for the tag array. It is a real cost and the next
+  thing worth an audit, but it is not this issue's probe and it does not belong in a verdict about
+  `following`.
 
 ## Why compression is off
 
