@@ -198,6 +198,79 @@ Three audit findings that the measurements contradicted, kept here because they 
   thing worth an audit, but it is not this issue's probe and it does not belong in a verdict about
   `following`.
 
+## Runtime tuning gate (issue #5)
+
+Verdict: **verify-and-leave.** `start.sh`, `application.properties` and `Dto.java` are unchanged by
+this issue. One candidate was carried to a measurement and the other three surfaces were ruled out.
+None of them clears the bar of naming a hot path, saying why the current default hurts, and naming
+a measurement that would settle it.
+
+**The one lead worth evaluating: `-XX:+UseG1GC` is inert on the box JDK.** It is redundant — G1 is
+the ergonomic default — so the only question worth asking is whether removing it changes anything.
+Measured on Temurin 27+35, the exact build `install.sh` pins by checksum, comparing the real flag
+line with and without it:
+
+```
+java -Xms1g -Xmx3g -XX:MaxGCPauseMillis=100 [-XX:+UseG1GC] -XX:+PrintFlagsFinal -version
+java -Xms1g -Xmx3g -XX:MaxGCPauseMillis=100 [-XX:+UseG1GC] -Xlog:gc*        -version
+```
+
+| evidence | without `-XX:+UseG1GC` | with `-XX:+UseG1GC` |
+|---|---|---|
+| `UseG1GC` in `-XX:+PrintFlagsFinal` (897 lines) | `true {product} {ergonomic}` | `true {product} {command line}` |
+| collector in `-Xlog:gc*` | `Using G1` | `Using G1` |
+| region size / heap min / initial / max | 2M / 1G / 1G / 3G | 2M / 1G / 1G / 3G |
+| GC workers, parallel / concurrent | 8 / 2 | 8 / 2 |
+| startup + exit log, timestamps stripped | identical | identical |
+
+Same value, same collector, same heap geometry, same workers. The only line that differs anywhere
+in the table is the *origin* annotation on the flag that was itself set. Two lines looked like they
+might differ and were refuted rather than assumed: `SharedBaseAddress` moves between two runs of
+the *same* command (536870912 vs 2264924160), so it is ASLR and not the flag, and the CDS base
+addresses move with it. Stripping timestamps leaves the two logs identical line for line, including
+the exit line (3145728K reserved, 1050624K committed, 511 free 2M regions). The same run also
+reports `UseCompactObjectHeaders 1` and `Compressed Oops: Enabled (Zero based)`, confirming the
+existing note that both are JDK 27 defaults rather than flags anyone added.
+
+So the deletion is real and it is also worth nothing, which is exactly what the gate is for. A flag
+whose value already equals the default cannot reach any hot path differently. (1) *Which hot
+path*: none can be named, because no request path sees a different configuration. (2) *Why the
+current default hurts*: it does not, so there is no runtime cost to remove. (3) *What would confirm
+or refute it*: the measurement above is the refutation — the two configurations are the same
+configuration. Removal is not free of an argument either: it would drop an explicit pin of the
+collector that `-XX:MaxGCPauseMillis=100` was reasoned about. `install.sh` pins the JDK by checksum,
+so nothing would change the default under us silently, which makes the pin cheap insurance and the
+deletion zero gain. Left as written, recorded here so the lead is not re-proposed.
+
+Platform limit, stated rather than glossed: this was measured on Windows x64, while the box runs
+the same 27+35 Temurin build on Linux x64. Default-GC selection is a property of the HotSpot build
+rather than the OS, but that is an argument from the source, not a second measurement, and it is
+the one thing that would have to be re-run on the box JDK to close it properly.
+
+**The serialization surface holds the one plausible hot path left, and it fails on measurement,
+not on merit.** ~72% of requests carry `createdAt`/`updatedAt` (lists 32% + detail 20% + comments
+20%), so timestamps are the only remaining serialization work with a hot path to point at. But
+`Dto.ts` is already one static `DateTimeFormatter`, compiled once at class-init and safe to share,
+so per call there is one `format` against a pre-built pattern — the shape is not re-doing work per
+request. The only cheaper candidate is a hand-rolled formatter, which would trade SPEC conformance
+(the suite pins the exact RFC-3339 shape) for a microsecond-scale win that cannot be measured here.
+Anything measured on this box would be a JVM-level microbenchmark number, which "Unmeasured" above
+explicitly refuses to call a speedup, so adopting it would mean claiming an unmeasured improvement.
+It wants a real box and a request-level measurement, which is not this issue.
+
+**Tomcat and Hikari have nothing left that is not already reasoned.** All four connector knobs are
+documented in `application.properties` and closed in earlier issues. One thing worth writing down
+while looking: with
+`spring.threads.virtual.enabled=true` the platform thread pool is gone, so `server.tomcat.threads.*`
+would be a *second* provably-redundant knob rather than a change. Hikari's `keepalive-time=30000`
+is the only one not already accounted for; at saturation the pool holds no idle connections for it
+to ping, and at low load it is what stops Postgres reaping an idle backend under the 600 s
+`max-lifetime`, so there is no reason to move it.
+
+None of the above is a speedup claim. What was measured here is *configuration identity* — a flag
+table and a startup log — which is deterministic and is exactly what this verdict rests on. It is
+not an application measurement and it does not say the app got faster, because nothing changed.
+
 ## Why compression is off
 
 `SPEC.md` notes Nginx gzips JSON over 1 KB, and serving directly (rule 10) gives that up — so it looks
@@ -218,4 +291,4 @@ it should be tried as a measurement on a box, not reasoned about.
 
 Caching, extra indexes, async writes (rules 3/5/6). No WebFlux: this is blocking JDBC, which
 suits virtual threads. No JVM-flag shotgunning — G1 and compact object headers are JDK 27
-defaults already.
+defaults already (the `-XX:+UseG1GC` half of that is measured, not assumed: see "Runtime tuning gate").
